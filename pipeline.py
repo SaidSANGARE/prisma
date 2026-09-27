@@ -25,6 +25,10 @@ EMB_MODEL = os.getenv("EMB_MODEL", "nvidia/nemotron-3-embed-1b")
 VISION_MODEL = os.getenv("VISION_MODEL", "meta/llama-3.2-90b-vision-instruct")
 # Modèles de secours, essayés dans l'ordre si le premier échoue ou tarde (séparés par des virgules)
 VISION_FALLBACKS = [m.strip() for m in os.getenv("VISION_FALLBACKS", "meta/llama-3.2-11b-vision-instruct").split(",") if m.strip()]
+try:
+    MAX_FILE_BYTES = int(os.getenv("MAX_FILE_SIZE_MB", "25")) * 1024 * 1024
+except ValueError:
+    MAX_FILE_BYTES = 25 * 1024 * 1024
 
 
 def _client(timeout=120.0, retries=2):
@@ -117,10 +121,10 @@ def ocr_page(page, delai_max=150):
 
 
 def _lire_docx(contenu):
+    from io import BytesIO
     from docx import Document
-    d = Document.__init__  # noqa (import check)
-    from docx import Document as D
-    doc = D(__import__("io").BytesIO(contenu))
+
+    doc = Document(BytesIO(contenu))
     morceaux = [p.text for p in doc.paragraphs if p.text.strip()]
     for tbl in doc.tables:
         for row in tbl.rows:
@@ -130,7 +134,7 @@ def _lire_docx(contenu):
 
 def lire_fichier(contenu, nom, ocr=True, progression=None):
     """Un seul fichier (PDF, docx, txt, image). Pratique pour un test isolé."""
-    return lire_fichiers([(contenu, nom)], ocr=ocr)
+    return lire_fichiers([(contenu, nom)], ocr=ocr, progression=progression)
 
 
 def lire_fichiers(items, ocr=True, workers=4, progression=None):
@@ -139,6 +143,10 @@ def lire_fichiers(items, ocr=True, workers=4, progression=None):
     ce qui accélère fortement la lecture d'un dossier avec plusieurs pièces scannées."""
     pages, docs_ouverts = [], []
     for contenu, nom in items:
+        if len(contenu) > MAX_FILE_BYTES:
+            pages.append({"doc": nom, "page": 1, "texte": "", "ocr": False,
+                          "erreur": f"Fichier trop volumineux (maximum {MAX_FILE_BYTES // 1024 ** 2} Mo)."})
+            continue
         ext = nom.lower().rsplit(".", 1)[-1]
         try:
             if ext == "docx":
@@ -222,6 +230,8 @@ def extraire_exigences(pages, taille_bloc=4, progression=None, workers=4):
     trouvees, vues = [], set()
     for lot in resultats:  # on garde l'ordre des pages malgré le traitement parallèle
         for ex in (lot or []):
+            if not isinstance(ex, dict) or not isinstance(ex.get("texte"), str):
+                continue
             cle = re.sub(r"\W+", " ", ex.get("texte", "").lower())[:80]
             if cle and cle not in vues:
                 vues.add(cle)
@@ -245,6 +255,9 @@ def _decouper(pages, taille=900, chevauchement=150):
 
 
 def _embed(textes, type_entree):
+    if not textes:
+        return np.empty((0, 0), dtype="float32")
+
     vecs = []
     for i in range(0, len(textes), 32):
         lot = textes[i:i + 32]
@@ -290,6 +303,22 @@ def _norm(s):
     return re.sub(r"\s+", " ", s.lower()).strip()
 
 
+def _normaliser_verdict(rep):
+    if not isinstance(rep, dict):
+        return {"verdict": "manquant", "justification": "Réponse IA invalide.",
+                "citation": "", "action": ""}
+    verdict = rep.get("verdict")
+    if verdict not in {"conforme", "partiel", "manquant"}:
+        return {"verdict": "manquant", "justification": "Verdict IA invalide, vérification requise.",
+                "citation": "", "action": "Vérifier manuellement cette exigence."}
+    return {
+        "verdict": verdict,
+        "justification": str(rep.get("justification") or ""),
+        "citation": str(rep.get("citation") or ""),
+        "action": str(rep.get("action") or ""),
+    }
+
+
 def verifier_toutes(exigences, index, progression=None, workers=4):
     """Vérifie toutes les exigences EN PARALLÈLE (plusieurs appels API à la fois)."""
     res, faits = [None] * len(exigences), 0
@@ -317,14 +346,13 @@ def verifier(exigence, index):
     bloc = "\n\n".join(f"[{p['doc']} - page {p['page']}]\n{p['texte']}" for p in preuves)
     rep = appel_json(PROMPT_VERDICT,
                      f"DATE DU JOUR : {date.today():%d/%m/%Y}\n\nEXIGENCE : {exigence['texte']}\n\nEXTRAITS :\n{bloc}")
-    if not isinstance(rep, dict):
-        rep = {"verdict": "manquant", "justification": "Réponse invalide.", "citation": "", "action": ""}
+    rep = _normaliser_verdict(rep)
     citation = rep.get("citation", "")
     # Anti-hallucination : la citation doit réellement exister dans les extraits
     verifiee, source = True, None
     if citation:
         for p in preuves:
-            if _norm(citation)[:60] in _norm(p["texte"]):
+            if _norm(citation) in _norm(p["texte"]):
                 source = p
                 break
         verifiee = source is not None
@@ -389,7 +417,8 @@ def plan_action(resultats, jours_restants=None):
             } for r in a_traiter[i:i + 5]],
         }
         rep = appel_json(PROMPT_PLAN, json.dumps(entree, ensure_ascii=False))
-        plan += [rep] if isinstance(rep, dict) else rep
+        reponses = [rep] if isinstance(rep, dict) else rep if isinstance(rep, list) else []
+        plan += [a for a in reponses if isinstance(a, dict)]
     infos = {r["id"]: r for r in a_traiter}
     rang = {"bloquant": 0, "regulariser": 1, "engagement": 2}
     for a in plan:
@@ -435,3 +464,45 @@ def checklist_secteur(secteur, precisions=""):
         requete += f" Précisions complémentaires données par l'utilisateur : {precisions}"
     rep = appel_json(PROMPT_CHECKLIST, requete)
     return rep if isinstance(rep, dict) else {"categories": []}
+
+
+def charger_rapport(contenu):
+    """Valide et charge un rapport JSON précédemment exporté par PRISMA."""
+    try:
+        rapport = json.loads(contenu.decode("utf-8") if isinstance(contenu, bytes) else contenu)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Le fichier JSON est invalide ou illisible.") from exc
+    if not isinstance(rapport, dict) or not isinstance(rapport.get("exigences"), list) \
+            or not isinstance(rapport.get("resultats"), list):
+        raise ValueError("Le fichier ne contient pas un rapport PRISMA valide.")
+    return rapport
+
+
+def rapport_demo():
+    """Retourne un dossier fictif local pour tester l'interface sans API."""
+    exigences = [
+        {"id": "E1", "texte": "Fournir une attestation fiscale en cours de validité.",
+         "type": "administrative", "obligatoire": True, "page": 3},
+        {"id": "E2", "texte": "Présenter au moins deux références similaires sur les trois dernières années.",
+         "type": "technique", "obligatoire": True, "page": 7},
+        {"id": "E3", "texte": "Joindre les états financiers des deux derniers exercices.",
+         "type": "financiere", "obligatoire": True, "page": 9},
+        {"id": "E4", "texte": "Proposer un délai d'exécution de 30 jours maximum.",
+         "type": "engagement", "obligatoire": True, "page": 12},
+    ]
+    resultats = [
+        {**exigences[0], "verdict": "conforme", "justification": "Le document fourni est valide.",
+         "citation": "Attestation fiscale valable jusqu'au 31/12/2026.", "document": "attestation_fiscale.pdf",
+         "page": 1, "action": "", "citation_verifiee": True},
+        {**exigences[1], "verdict": "partiel", "justification": "Une seule référence est documentée sur les deux demandées.",
+         "citation": "Référence similaire : projet informatique 2025.", "document": "references.pdf",
+         "page": 2, "action": "Ajouter une seconde référence similaire.", "citation_verifiee": True},
+        {**exigences[2], "verdict": "manquant", "justification": "Aucun état financier n'a été fourni.",
+         "citation": "", "document": "", "page": None,
+         "action": "Joindre les états financiers des deux derniers exercices.", "citation_verifiee": True},
+        {**exigences[3], "verdict": "manquant", "justification": "Cet engagement doit être renseigné dans l'offre.",
+         "citation": "", "document": "", "page": None,
+         "action": "Inscrire un délai d'exécution inférieur ou égal à 30 jours.", "citation_verifiee": True},
+    ]
+    return {"exigences": exigences, "resultats": resultats,
+            "decision": decision(resultats)}

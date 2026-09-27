@@ -1,0 +1,10 @@
+# Secrets and local configuration
+.env
+
+# Local database and encrypted documents
+.prisma/
+
+# Python artifacts
+.venv/
+__pycache__/
+*.py[cod]

@@ -1,4 +1,5 @@
 """PRISMA - interface Streamlit. Lancer : streamlit run app.py"""
+import json
 import os
 import time
 from datetime import date
@@ -6,15 +7,53 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
+import db
 import pipeline as pr
+import report as pdf_report
+import storage
+
+db.init_db()
 
 st.set_page_config(page_title="PRISMA", page_icon="🔺", layout="wide")
 st.title("🔺 PRISMA")
 st.caption("Chaque exigence, une facette claire. Analysez un DAO, vérifiez votre dossier, sachez quoi corriger.")
 
 ss = st.session_state
-for k in ("exigences", "resultats", "plan", "checklist"):
+for k in ("exigences", "resultats", "plan", "checklist", "report_id", "user"):
     ss.setdefault(k, None)
+DEMO_MODE = os.getenv("PRISMA_DEMO_MODE", "").lower() in {"1", "true", "oui"}
+
+if not ss.user:
+    st.header("Accès à PRISMA")
+    login_tab, register_tab = st.tabs(["Se connecter", "Créer un compte"])
+    with login_tab:
+        with st.form("login_form"):
+            login_email = st.text_input("E-mail")
+            login_password = st.text_input("Mot de passe", type="password")
+            login_submit = st.form_submit_button("Se connecter", type="primary")
+        if login_submit:
+            user = db.authenticate(login_email, login_password)
+            if user:
+                ss.user = user
+                st.rerun()
+            st.error("E-mail ou mot de passe incorrect.")
+    with register_tab:
+        with st.form("register_form"):
+            register_email = st.text_input("E-mail", key="register_email")
+            register_password = st.text_input("Mot de passe (10 caractères minimum)", type="password")
+            register_confirmation = st.text_input("Confirmer le mot de passe", type="password")
+            register_submit = st.form_submit_button("Créer le compte")
+        if register_submit:
+            if register_password != register_confirmation:
+                st.error("Les mots de passe ne correspondent pas.")
+            else:
+                try:
+                    ss.user = db.create_user(register_email, register_password)
+                    st.success("Compte créé. Connexion en cours...")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+    st.stop()
 
 with st.expander("🧭 0. Je n'ai pas encore de DAO : que dois-je préparer selon mon secteur ?", expanded=False):
     st.write("Avant même de recevoir un appel d'offres précis, préparez à l'avance les pièces "
@@ -45,7 +84,7 @@ with st.expander("🧭 0. Je n'ai pas encore de DAO : que dois-je préparer selo
         st.download_button("Télécharger la checklist (Markdown)", "\n".join(lignes_md).encode("utf-8"),
                            f"checklist_{secteur.split(' ')[0].lower()}.md", "text/markdown")
 
-if not os.getenv("NVIDIA_API_KEY"):
+if not os.getenv("NVIDIA_API_KEY") and not DEMO_MODE:
     st.error("Clé NVIDIA_API_KEY absente. Ajoutez-la dans les Secrets (Streamlit Cloud) ou dans le fichier .env.")
     st.stop()
 
@@ -53,6 +92,34 @@ TYPES = ["pdf", "png", "jpg", "jpeg", "docx", "txt"]
 
 with st.sidebar:
     st.header("Options")
+    st.caption(f"Connecté : {ss.user['email']}")
+    if st.button("Se déconnecter"):
+        ss.clear()
+        st.rerun()
+    if not storage.is_configured():
+        st.warning("Stockage chiffré inactif : configurez PRISMA_STORAGE_KEY.")
+    with st.expander("Mes rapports"):
+        rapports = db.list_reports(ss.user["id"])
+        if rapports:
+            choix = st.selectbox("Rapport à charger", rapports, format_func=lambda r: r["name"])
+            if st.button("Charger ce rapport"):
+                charge = db.load_report(ss.user["id"], choix["id"])
+                ss.exigences = charge["exigences"]
+                ss.resultats = charge["resultats"]
+                ss.plan = charge.get("plan")
+                ss.report_id = choix["id"]
+                st.rerun()
+        else:
+            st.caption("Aucun rapport sauvegardé.")
+    if DEMO_MODE:
+        st.warning("Mode démonstration local : aucun appel NVIDIA ne sera effectué.")
+        if st.button("Charger les données de démonstration"):
+            rapport_demo = pr.rapport_demo()
+            ss.exigences = rapport_demo["exigences"]
+            ss.resultats = rapport_demo["resultats"]
+            ss.plan = None
+            ss.report_id = str(__import__("uuid").uuid4())
+    api_active = not DEMO_MODE
     ocr = st.checkbox("Lire les scans et photos (OCR par IA)", value=True)
     limite = st.date_input("Date limite de dépôt (optionnel)", value=None)
     st.caption(f"Texte : {pr.LLM_MODEL}\n\nVision : {pr.VISION_MODEL}")
@@ -60,10 +127,13 @@ with st.sidebar:
     with st.expander("🔧 Diagnostic OCR"):
         st.caption("Testez la lecture d'UN scan ou d'UNE photo, sans lancer toute l'analyse.")
         test = st.file_uploader("Image ou PDF scanné", type=TYPES, key="diag")
-        if test and st.button("Tester la lecture"):
+        if test and st.button("Tester la lecture", disabled=DEMO_MODE):
             t0 = time.time()
+            progression_ocr = st.progress(0.0, text="Lecture de la page...")
             with st.spinner("Lecture en cours (2 à 3 minutes au maximum)..."):
-                pages_test = pr.lire_fichier(test.getvalue(), test.name, ocr=True)
+                pages_test = pr.lire_fichier(test.getvalue(), test.name, ocr=True,
+                                             progression=lambda x: progression_ocr.progress(x))
+            progression_ocr.empty()
             st.write(f"Durée : {time.time() - t0:.0f} s")
             for pg in pages_test:
                 st.write(f"Page {pg['page']} : {'lue par OCR' if pg['ocr'] else 'texte natif'}")
@@ -71,6 +141,18 @@ with st.sidebar:
                     st.error(pg["erreur"])
                 st.text(pg["texte"][:1500])
 jours = (limite - date.today()).days if limite else None
+
+with st.expander("Reprendre une analyse exportée", expanded=False):
+    rapport_charge = st.file_uploader("Fichier JSON PRISMA", type=["json"], key="rapport_charge")
+    if rapport_charge and st.button("Charger le rapport"):
+        try:
+            rapport = pr.charger_rapport(rapport_charge.getvalue())
+            ss.exigences = rapport["exigences"]
+            ss.resultats = rapport["resultats"]
+            ss.plan = None
+            st.success("Analyse chargée. Les résultats sont disponibles ci-dessous.")
+        except ValueError as e:
+            st.error(str(e))
 
 
 
@@ -87,13 +169,16 @@ def lire_fichiers(fichiers, barre_txt):
 st.header("1. Le dossier d'appel d'offres (DAO)")
 dao = st.file_uploader("Déposez le DAO (PDF, scan ou photo)", type=TYPES, key="dao")
 
-if dao and st.button("Extraire les exigences", type="primary"):
+if dao and st.button("Extraire les exigences", type="primary", disabled=DEMO_MODE):
+    ss.report_id = str(__import__("uuid").uuid4())
     pages, avert = lire_fichiers([dao], "Lecture du DAO...")
     for a in avert:
         st.warning(a)
     if sum(len(p["texte"]) for p in pages) < 200:
         st.error("Aucun texte lisible dans ce document.")
     else:
+        if storage.is_configured():
+            storage.save_document(ss.user["id"], ss.report_id, dao.name, dao.getvalue())
         n_ocr = sum(p["ocr"] for p in pages)
         if n_ocr:
             st.info(f"{n_ocr} page(s) lue(s) par OCR IA.")
@@ -117,7 +202,10 @@ if ss.exigences:
     pieces = st.file_uploader("Déposez les pièces (PDF, scans ou photos, plusieurs possibles)",
                               type=TYPES, accept_multiple_files=True, key="pieces")
 
-    if pieces and st.button("Vérifier la conformité", type="primary"):
+    if pieces and st.button("Vérifier la conformité", type="primary", disabled=DEMO_MODE):
+        if storage.is_configured():
+            for piece in pieces:
+                storage.save_document(ss.user["id"], ss.report_id, piece.name, piece.getvalue())
         pages_pme, avert = lire_fichiers(pieces, "Lecture des pièces (les scans prennent plus de temps)...")
         for a in avert:
             st.warning(a)
@@ -138,6 +226,9 @@ if ss.resultats:
 
     # ---- Décision Go / No-go
     d = pr.decision(res)
+    payload = {"exigences": ss.exigences, "resultats": res, "decision": d, "plan": ss.plan}
+    if ss.report_id:
+        db.save_report(ss.user["id"], ss.report_id, "Analyse PRISMA", payload)
     if d["niveau"] == "nogo":
         st.error(f"🚫 **{d['titre']}** : {d['message']}")
     elif d["niveau"] == "corriger":
@@ -181,6 +272,12 @@ if ss.resultats:
                                                     "justification", "citation", "document", "page", "action"])
         st.download_button("Télécharger le rapport (CSV)", export.to_csv(index=False).encode("utf-8-sig"),
                            "rapport_prisma.csv", "text/csv")
+        rapport_json = json.dumps({"exigences": ss.exigences, "resultats": res,
+                       "decision": d}, ensure_ascii=False, indent=2, default=str)
+        st.download_button("Télécharger l'analyse complète (JSON)", rapport_json.encode("utf-8"),
+                   "rapport_prisma.json", "application/json")
+        st.download_button("Télécharger le rapport PDF", pdf_report.build_pdf(res, d, pr.score_global(res)),
+                   "rapport_prisma.pdf", "application/pdf")
 
     # ---- Onglet 2 : plan d'action
     with tab2:
